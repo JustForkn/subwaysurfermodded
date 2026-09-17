@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Subway Surfers Mod Menu (Liquid Glass)
+// @name         Subway Surfers Mod Menu — JustForkn
 // @namespace    modmenu.local
-// @version      2.0
-// @description  Standalone mod menu — no game files need editing. Works via Tampermonkey (recommended) or pasted into DevTools console.
-// @match        *://*/*
+// @version      2.1
+// @description  Unity WebGL mod menu for justforkn.github.io/subwaysurfermodded
+// @match        https://justforkn.github.io/subwaysurfermodded/*
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
@@ -29,17 +29,17 @@
 (function () {
     "use strict";
 
-    if (window.__mmInstalled) return;
+    if (window.__mmCleanup) {
+        try { window.__mmCleanup(); } catch (e) {}
+    }
     window.__mmInstalled = true;
 
     // ============================================================
-    // 1. MEMORY ACQUISITION
-    //    Try to capture the game's live WebAssembly memory two ways:
-    //    (a) hook allocation as it happens (works if this runs before the
-    //        game finishes loading), and (b) search the loaded game object
-    //        for an already-existing memory reference (works even if this
-    //        script is injected late, e.g. via a bookmarklet after the
-    //        game is already running).
+    // 1. MEMORY ACQUISITION — Unity WebGL / this site
+    //    Your page loads UnityLoader.2019.2.js and exposes the live
+    //    Unity instance as window.unityGame. The original script only
+    //    searched a few generic shapes, so this version hooks the exact
+    //    loader path and also checks Emscripten heap views.
     // ============================================================
 
     var state = {
@@ -50,97 +50,330 @@
         frozen: {},
         freezeTimer: null,
         panelOpen: false,
-        wizardStep: 0
+        wizardStep: 0,
+        unityReady: false,
+        coinAddr: null,
+        coinValue: null,
+        coinConfidence: 0,
+        coinCandidates: new Map(),
+        coinScanActive: false,
+        coinScanTimer: null,
+        coinLastCandidateCount: 0,
+        coinAutoStarted: false
     };
 
     function setMemory(mem, source) {
-        if (!mem || !mem.buffer) return;
-        if (!state.memory || mem.buffer.byteLength > state.memory.buffer.byteLength) {
-            state.memory = mem;
-            state.memorySource = source;
-            log("Memory captured via " + source + " (" + (mem.buffer.byteLength / 1e6).toFixed(1) + " MB)");
-            updateStatusDot();
+        try {
+            if (!mem || !mem.buffer) return false;
+            if (!state.memory || mem.buffer.byteLength >= state.memory.buffer.byteLength) {
+                state.memory = mem;
+                state.memorySource = source;
+                log("Memory linked via " + source + " (" + (mem.buffer.byteLength / 1e6).toFixed(1) + " MB)");
+                updateStatusDot();
+            }
+            return true;
+        } catch (e) {
+            return false;
         }
     }
 
-    // --- (a) live hook, catches memory as the game allocates it ---
-    var OrigMemory = window.WebAssembly && window.WebAssembly.Memory;
-    if (OrigMemory) {
-        window.WebAssembly.Memory = function (opts) {
-            var mem = new OrigMemory(opts);
-            setMemory(mem, "WebAssembly.Memory hook");
-            return mem;
-        };
-        window.WebAssembly.Memory.prototype = OrigMemory.prototype;
-    }
-    function captureFromInstance(instance) {
-        try {
-            var exp = instance && instance.exports;
-            if (exp && exp.memory && exp.memory.buffer) setMemory(exp.memory, "wasm export");
-        } catch (e) {}
-    }
-    ["instantiate", "instantiateStreaming"].forEach(function (name) {
-        var orig = window.WebAssembly && window.WebAssembly[name];
-        if (!orig) return;
-        window.WebAssembly[name] = function () {
-            return orig.apply(WebAssembly, arguments).then(function (result) {
-                captureFromInstance(result && result.instance ? result.instance : result);
-                return result;
-            });
-        };
-    });
-    var OrigInstance = window.WebAssembly && window.WebAssembly.Instance;
-    if (OrigInstance) {
-        window.WebAssembly.Instance = function (mod, imports) {
-            var inst = new OrigInstance(mod, imports);
-            captureFromInstance(inst);
-            return inst;
-        };
-        window.WebAssembly.Instance.prototype = OrigInstance.prototype;
-    }
+    function captureModule(mod, source) {
+        if (!mod) return false;
 
-    // --- (b) late fallback: search common Emscripten/Unity object shapes ---
-    function tryLateCapture() {
-        if (state.memory) return true;
-        var candidates = [
-            function () { return window.unityGame && window.unityGame.Module && window.unityGame.Module.wasmMemory; },
-            function () { return window.unityGame && window.unityGame.Module && window.unityGame.Module.asm && window.unityGame.Module.asm.memory; },
-            function () { return window.Module && window.Module.wasmMemory; },
-            function () { return window.gameInstance && window.gameInstance.Module && window.gameInstance.Module.wasmMemory; }
-        ];
-        for (var i = 0; i < candidates.length; i++) {
-            try {
-                var m = candidates[i]();
-                if (m instanceof WebAssembly.Memory) { setMemory(m, "late lookup"); return true; }
-            } catch (e) {}
-        }
-        // last resort: shallow scan of window.unityGame.Module's own properties
         try {
-            var mod = window.unityGame && window.unityGame.Module;
-            if (mod) {
-                for (var k in mod) {
-                    if (mod[k] instanceof WebAssembly.Memory) { setMemory(mod[k], "object scan"); return true; }
-                }
+            if (mod.wasmMemory && mod.wasmMemory.buffer) {
+                state.unityReady = true;
+                return setMemory(mod.wasmMemory, source + " → wasmMemory");
+            }
+
+            if (mod.asm && mod.asm.memory && mod.asm.memory.buffer) {
+                state.unityReady = true;
+                return setMemory(mod.asm.memory, source + " → asm.memory");
+            }
+
+            if (mod.HEAP32 && mod.HEAP32.buffer) {
+                state.unityReady = true;
+                var heapMem = {
+                    get buffer() { return mod.HEAP32 && mod.HEAP32.buffer ? mod.HEAP32.buffer : null; }
+                };
+                return setMemory(heapMem, source + " → HEAP32");
+            }
+
+            // Emscripten may expose typed heap views even when the Memory
+            // object itself is not directly exposed.
+            var heap = mod.HEAP8 || mod.HEAPU8 || mod.HEAP32 || mod.HEAPU32 || mod.HEAPF32;
+            if (heap && heap.buffer) {
+                state.unityReady = true;
+
+                var heapOwner = mod;
+                var memoryView = {
+                    get buffer() {
+                        var h = heapOwner.HEAP8 || heapOwner.HEAPU8 || heapOwner.HEAP32 ||
+                                heapOwner.HEAPU32 || heapOwner.HEAPF32;
+                        return h ? h.buffer : null;
+                    }
+                };
+
+                if (memoryView.buffer) return setMemory(memoryView, source + " → Emscripten heap");
             }
         } catch (e) {}
+
         return false;
     }
-    var lateScan = setInterval(function () {
-        if (tryLateCapture()) clearInterval(lateScan);
-    }, 1000);
+
+    function captureUnityGame() {
+        var ok = false;
+
+        try {
+            if (window.unityGame && window.unityGame.Module) {
+                ok = captureModule(window.unityGame.Module, "window.unityGame.Module") || ok;
+            }
+        } catch (e) {}
+
+        try {
+            if (window.Module) {
+                ok = captureModule(window.Module, "window.Module") || ok;
+            }
+        } catch (e) {}
+
+        try {
+            if (window.my4399UnityModule && typeof window.my4399UnityModule === "object") {
+                ok = captureModule(window.my4399UnityModule, "my4399UnityModule") || ok;
+            }
+        } catch (e) {}
+
+        return ok;
+    }
+
+    // Hook the exact UnityLoader.instantiate() call used by this repo.
+    // unity.js calls:
+    //   window.unityGame = window.UnityLoader.instantiate("game", ..., { Module: ... })
+    function hookUnityLoader() {
+        try {
+            var loader = window.UnityLoader;
+            if (!loader || typeof loader.instantiate !== "function" || loader.__mmPatched) return false;
+
+            var originalInstantiate = loader.instantiate;
+
+            loader.instantiate = function (container, url, options) {
+                options = options || {};
+                options.Module = options.Module || {};
+
+                var module = options.Module;
+                var previousRuntimeInit = module.onRuntimeInitialized;
+
+                module.onRuntimeInitialized = function () {
+                    captureModule(module, "UnityLoader Module");
+                    setTimeout(captureUnityGame, 0);
+                    if (typeof previousRuntimeInit === "function") {
+                        return previousRuntimeInit.apply(this, arguments);
+                    }
+                };
+
+                var game = originalInstantiate.apply(this, arguments);
+
+                setTimeout(function () {
+                    try {
+                        if (game && game.Module) captureModule(game.Module, "UnityLoader result");
+                    } catch (e) {}
+                    captureUnityGame();
+                    updateStatusDot();
+                }, 0);
+
+                return game;
+            };
+
+            loader.__mmPatched = true;
+            log("UnityLoader hook installed");
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Keep checking while the asynchronously-loaded Unity files appear.
+    var unityPolls = 0;
+    var unityScan = setInterval(function () {
+        hookUnityLoader();
+        captureUnityGame();
+        if (state.memory || ++unityPolls > 600) clearInterval(unityScan);
+    }, 100);
+
+    hookUnityLoader();
+    captureUnityGame();
 
     // ============================================================
     // 2. MEMORY HELPERS
     // ============================================================
 
     function getView() {
-        if (!state.memory) return null;
-        return state.watchType === "float32" ? new Float32Array(state.memory.buffer) : new Int32Array(state.memory.buffer);
+        captureUnityGame();
+        if (!state.memory || !state.memory.buffer) return null;
+
+        try {
+            return state.watchType === "float32"
+                ? new Float32Array(state.memory.buffer)
+                : new Int32Array(state.memory.buffer);
+        } catch (e) {
+            return null;
+        }
     }
-    function readAt(addr) { var v = getView(); return v ? v[addr / 4] : null; }
+
+    function readAt(addr) {
+        var v = getView();
+        if (!v || addr < 0 || (addr % 4) !== 0 || addr / 4 >= v.length) return null;
+        return v[addr / 4];
+    }
+
     function writeAt(addr, value) {
-        var v = getView(); if (!v) return;
-        v[addr / 4] = state.watchType === "float32" ? parseFloat(value) : (parseInt(value, 10) | 0);
+        var v = getView();
+        if (!v || addr < 0 || (addr % 4) !== 0 || addr / 4 >= v.length) return false;
+
+        var n = state.watchType === "float32" ? parseFloat(value) : parseInt(value, 10);
+        if (!Number.isFinite(n)) return false;
+
+        v[addr / 4] = state.watchType === "float32" ? n : (n | 0);
+        return true;
+    }
+
+    // ============================================================
+    // AUTOMATIC COIN-ID FINDER
+    // No manual value entry is required. We look for a small integer
+    // counter in Unity memory, then promote addresses that repeatedly
+    // increment by a coin-sized amount while remaining stable otherwise.
+    // ============================================================
+
+    function findLikelySavedCoinValue() {
+        var keys = [];
+        try {
+            for (var i = 0; i < localStorage.length; i++) keys.push(localStorage.key(i));
+            keys.sort(function(a, b) {
+                return (/coin|currency|money/i.test(b || '') ? 1 : 0) - (/coin|currency|money/i.test(a || '') ? 1 : 0);
+            });
+            for (var j = 0; j < keys.length; j++) {
+                var k = keys[j];
+                if (!k || !/coin|currency|money/i.test(k)) continue;
+                var raw = localStorage.getItem(k);
+                if (raw == null) continue;
+                var n = Number(String(raw).replace(/,/g, '').match(/-?\d+(?:\.\d+)?/)?.[0]);
+                if (Number.isInteger(n) && n >= 0 && n <= 10000000) return n;
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function setCoinAddress(addr, value, confidence, reason) {
+        if (addr == null || !Number.isFinite(value)) return;
+        state.coinAddr = addr | 0;
+        state.coinValue = value | 0;
+        state.coinConfidence = confidence || state.coinConfidence || 1;
+        state.results = [{ addr: state.coinAddr, value: state.coinValue, coin: true }];
+        var idBox = document.getElementById("mm-coin-id");
+        var valBox = document.getElementById("mm-coin-live");
+        var status = document.getElementById("mm-coin-status");
+        if (idBox) idBox.textContent = "0x" + state.coinAddr.toString(16);
+        if (valBox) valBox.textContent = String(state.coinValue);
+        if (status) status.textContent = "🟢 Coin ID locked (" + (reason || "auto-detected") + ")";
+        renderResults();
+        log("Automatic coin ID: 0x" + state.coinAddr.toString(16) + " = " + state.coinValue);
+    }
+
+    function autoCoinPrime() {
+        if (state.coinAutoStarted) return;
+        var view = getView();
+        if (!view) return;
+        state.coinAutoStarted = true;
+        var saved = findLikelySavedCoinValue();
+        state.coinCandidates.clear();
+        state.coinScanActive = true;
+
+        var index = 0;
+        var total = view.length;
+        var chunk = 120000;
+        function process() {
+            if (!state.memory || !state.memory.buffer) { state.coinScanActive = false; return; }
+            try { view = getView(); total = view.length; } catch (e) { state.coinScanActive = false; return; }
+            var end = Math.min(index + chunk, total);
+            for (; index < end; index++) {
+                var v = view[index];
+                if (v < 0 || v > 10000000) continue;
+                if (saved !== null && v !== saved) continue;
+                var addr = index * 4;
+                state.coinCandidates.set(addr, { value: v, plusOne: 0, changes: 0, stable: 0, lastChange: 0 });
+                if (state.coinCandidates.size >= 30000) { index = total; break; }
+            }
+            if (index < total) {
+                state.coinLastCandidateCount = state.coinCandidates.size;
+                setTimeout(process, 0);
+                return;
+            }
+            state.coinScanActive = false;
+            // A stale/unrelated localStorage coin-like value should never lock the finder to zero matches.
+            if (!state.coinCandidates.size && saved !== null) {
+                log("Saved-value hint had no memory matches; retrying automatic scan without the hint.");
+                state.coinAutoStarted = false;
+                setTimeout(autoCoinPrime, 0);
+                return;
+            }
+            state.coinLastCandidateCount = state.coinCandidates.size;
+            log("Auto coin finder watching " + state.coinCandidates.size + " candidate addresses" + (saved !== null ? " for saved value " + saved : ""));
+            beginCoinTracking();
+        }
+        process();
+    }
+
+
+    function coinLiveRefresh() {
+        if (state.coinAddr == null) return;
+        var current = readAt(state.coinAddr);
+        if (Number.isInteger(current)) {
+            state.coinValue = current;
+            var valBox = document.getElementById("mm-coin-live");
+            if (valBox) valBox.textContent = String(current);
+            var row = state.results.find(function(r){ return r.addr === state.coinAddr; });
+            if (row) row.value = current;
+        }
+    }
+    var coinLiveTimer = setInterval(coinLiveRefresh, 250);
+
+    function beginCoinTracking() {
+        if (state.coinScanTimer) clearInterval(state.coinScanTimer);
+        state.coinScanTimer = setInterval(function() {
+            var view = getView();
+            if (!view || !state.coinCandidates.size || state.coinAddr != null) return;
+            var best = null;
+            state.coinCandidates.forEach(function(c, addr) {
+                var idx = addr / 4;
+                if (idx < 0 || idx >= view.length) return;
+                var cur = view[idx];
+                if (!Number.isInteger(cur) || cur < 0 || cur > 10000000) return;
+                if (cur === c.value) {
+                    c.stable++;
+                    return;
+                }
+                var delta = cur - c.value;
+                c.changes++;
+                c.lastChange = Date.now();
+                if (delta === 1 || delta === 2 || delta === 3) c.plusOne++;
+                c.value = cur;
+                if (c.plusOne >= 2 && c.changes >= 2) {
+                    var score = c.plusOne * 20 + Math.min(c.stable, 50);
+                    if (!best || score > best.score) best = { addr: addr, value: cur, score: score, confidence: c.plusOne };
+                }
+            });
+            if (best) {
+                setCoinAddress(best.addr, best.value, best.confidence, "automatic change tracking");
+                state.coinCandidates.clear();
+                return;
+            }
+            var st = document.getElementById("mm-coin-status");
+            if (st) st.textContent = "🟡 Watching " + state.coinCandidates.size + " possible counters — coin ID will lock automatically";
+        }, 750);
+    }
+
+    function autoCoinTick() {
+        if (!state.memory || state.coinAddr != null || state.coinScanActive) return;
+        autoCoinPrime();
     }
 
     function scanNew(targetValue) {
@@ -220,7 +453,9 @@
 
     var css = document.createElement("style");
     css.textContent = `
-    #mm-fab{position:fixed;bottom:18px;right:18px;z-index:999999;width:52px;height:52px;border-radius:50%;
+    #mm-host{position:fixed;inset:0;z-index:2147483647;pointer-events:none;isolation:isolate;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+    #mm-host *{box-sizing:border-box;}
+    #mm-fab{position:absolute;bottom:18px;right:18px;z-index:2;pointer-events:auto;touch-action:manipulation;width:52px;height:52px;border-radius:50%;
       background:linear-gradient(145deg, rgba(255,255,255,.35), rgba(255,255,255,.08));
       backdrop-filter:blur(16px) saturate(180%);-webkit-backdrop-filter:blur(16px) saturate(180%);
       border:1px solid rgba(255,255,255,.4);box-shadow:0 6px 22px rgba(0,0,0,.35), inset 0 1px 1px rgba(255,255,255,.6);
@@ -231,7 +466,7 @@
       border:2px solid rgba(0,0,0,.3);}
     #mm-fab .dot.on{background:#22c55e;}
 
-    #mm-panel{position:fixed;top:18px;right:18px;width:308px;z-index:999998;display:none;
+    #mm-panel{position:absolute;top:18px;right:18px;width:308px;z-index:3;display:none;pointer-events:auto;user-select:none;
       font:12px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f3f4f6;
       border-radius:20px;overflow:hidden;
       background:linear-gradient(160deg, rgba(255,255,255,.16), rgba(255,255,255,.04));
@@ -245,6 +480,8 @@
     #mm-head .mm-x{cursor:pointer;opacity:.75;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;
       justify-content:center;background:rgba(255,255,255,.12);}
     #mm-head .mm-x:hover{opacity:1;background:rgba(255,255,255,.22);}
+    #mm-panel button,#mm-panel input,#mm-panel select,#mm-panel label,#mm-panel .mm-swatch{position:relative;z-index:10;pointer-events:auto;}
+    #mm-panel input[type=text]{user-select:text;-webkit-user-select:text;}
 
     #mm-tabs{position:relative;display:flex;gap:4px;padding:0 10px 10px;}
     #mm-tabs button{flex:1;padding:6px 0;border:none;border-radius:10px;background:rgba(255,255,255,.08);
@@ -295,6 +532,9 @@
     document.documentElement.style.setProperty("--mm-accent", accent);
     document.documentElement.style.setProperty("--mm-blur", blurAmt + "px");
 
+    var host = document.createElement("div");
+    host.id = "mm-host";
+
     var fab = document.createElement("div");
     fab.id = "mm-fab";
     fab.innerHTML = '✨<div class="dot" id="mm-dot"></div>';
@@ -313,7 +553,11 @@
       <div id="mm-body">
 
         <div class="mm-tabpane active" data-pane="scan">
-          <div class="mm-status" id="mm-mem-status">Waiting for game memory…</div>
+          <div class="mm-status" id="mm-mem-status">Waiting for Unity WebGL memory…</div>
+          <div class="mm-status" id="mm-coin-status">🟡 Automatic coin finder is waiting for Unity memory…</div>
+          <div class="mm-row tight">
+            <span class="mm-label">Coin ID</span><b id="mm-coin-id" style="font-size:11px">—</b><span class="mm-label" style="min-width:auto">Value</span><b id="mm-coin-live" style="font-size:11px">—</b>
+          </div>
           <div class="mm-row tight">
             <select id="mm-type"><option value="int32">Int32 (coins/ints)</option><option value="float32">Float32 (pos/speed)</option></select>
             <input type="text" id="mm-value" placeholder="value">
@@ -389,7 +633,7 @@
           <div class="mm-row tight" id="mm-swatches"></div>
           <div class="mm-row tight" style="margin-top:10px"><span class="mm-label">Glass blur</span><input type="range" id="mm-blur" min="4" max="40" value="22"></div>
           <div class="mm-row tight"><button class="mm-btn" id="mm-reset-pos">Reset panel position</button></div>
-          <div class="mm-hint">Shortcut: press <b>Insert</b> to show/hide the menu anytime.</div>
+          <div class="mm-hint">Shortcut: press <b>,</b> to show/hide the menu anytime.</div>
         </div>
 
         <div class="mm-tabpane" data-pane="log">
@@ -411,9 +655,17 @@
         if (dot) dot.classList.toggle("on", !!state.memory);
         var status = document.getElementById("mm-mem-status");
         if (status) {
-            status.textContent = state.memory
-                ? "✅ Memory linked (" + state.memorySource + ", " + (state.memory.buffer.byteLength / 1e6).toFixed(1) + " MB)"
-                : "⏳ Waiting for game memory… keep this open while the game loads.";
+            var canvas = findCanvas();
+            if (state.memory) {
+                status.textContent = "✅ Unity linked (" + state.memorySource + ", " +
+                    (state.memory.buffer.byteLength / 1e6).toFixed(1) + " MB" +
+                    (canvas ? ", canvas found" : ", waiting for canvas") + ")";
+                autoCoinTick();
+            } else {
+                status.textContent = state.unityReady
+                    ? "🟡 Unity found, waiting for live memory…"
+                    : "⏳ Waiting for Unity WebGL to initialize…";
+            }
         }
     }
 
@@ -428,7 +680,7 @@
             var row = document.createElement("div");
             row.className = "mm-item";
             row.innerHTML =
-                '<span>0x' + r.addr.toString(16) + ' = <b>' + r.value + '</b></span>' +
+                '<span>' + (r.coin ? '🪙 ' : '') + '0x' + r.addr.toString(16) + ' = <b>' + r.value + '</b></span>' +
                 '<span><input type="text" class="mm-setval" value="' + r.value + '">' +
                 '<button class="mm-btn mm-set">Set</button>' +
                 '<button class="mm-btn mm-freeze ' + (frozen ? "mm-active" : "") + '">' + (frozen ? "❄" : "Freeze") + '</button></span>';
@@ -452,7 +704,9 @@
     }
 
     // --- movement / visual tools ---
-    function findCanvas() { return document.querySelector("#gameContainer canvas, canvas#canvas, canvas"); }
+    function findCanvas() {
+        return document.querySelector('canvas[id="#canvas"], #game-container canvas, canvas#canvas, canvas');
+    }
     var flyState = { x: 0, y: 0, active: false, speed: 20 };
     function flyKeyHandler(e) {
         if (!flyState.active) return;
@@ -502,16 +756,40 @@
 
     function mount() {
         document.head.appendChild(css);
-        document.body.appendChild(fab);
-        document.body.appendChild(panel);
+        host.appendChild(fab);
+        host.appendChild(panel);
+        document.documentElement.appendChild(host);
 
-        fab.onclick = function () { state.panelOpen = !state.panelOpen; panel.style.display = state.panelOpen ? "block" : "none"; };
-        document.getElementById("mm-close").onclick = function () { state.panelOpen = false; panel.style.display = "none"; };
+        function stopMenuEvent(e) {
+            if (e && e.stopImmediatePropagation) e.stopImmediatePropagation();
+            if (e && e.stopPropagation) e.stopPropagation();
+        }
+        ["pointerdown","pointerup","click","dblclick","mousedown","mouseup","touchstart","touchend","wheel","contextmenu"].forEach(function(type){
+            host.addEventListener(type, stopMenuEvent, false);
+        });
+        host.addEventListener("keydown", function(e){
+            if (e.target && host.contains(e.target)) stopMenuEvent(e);
+        }, false);
+
+        fab.onclick = function (e) { stopMenuEvent(e); state.panelOpen = !state.panelOpen; panel.style.display = state.panelOpen ? "block" : "none"; };
+        document.getElementById("mm-close").onclick = function (e) { stopMenuEvent(e); state.panelOpen = false; panel.style.display = "none"; };
         document.addEventListener("keydown", function (e) {
-            if (e.key === "Insert") { state.panelOpen = !state.panelOpen; panel.style.display = state.panelOpen ? "block" : "none"; }
+            var t = e.target;
+            var typing = t && (
+                t.tagName === "INPUT" ||
+                t.tagName === "TEXTAREA" ||
+                t.tagName === "SELECT" ||
+                t.isContentEditable
+            );
+
+            if (!typing && e.key === ",") {
+                e.preventDefault();
+                state.panelOpen = !state.panelOpen;
+                panel.style.display = state.panelOpen ? "block" : "none";
+            }
         });
 
-        panel.querySelectorAll("#mm-tabs button").forEach(function (b) { b.onclick = function () { switchTab(b.dataset.tab); }; });
+        panel.querySelectorAll("#mm-tabs button").forEach(function (b) { b.onclick = function (e) { stopMenuEvent(e); switchTab(b.dataset.tab); }; });
 
         document.getElementById("mm-type").onchange = function (e) { state.watchType = e.target.value; };
         document.getElementById("mm-scan-new").onclick = function () { scanNew(document.getElementById("mm-value").value); };
@@ -603,7 +881,7 @@
         document.addEventListener("mouseup", function () { dragging = false; });
 
         updateStatusDot();
-        log("Mod menu ready. No game files were modified — this is running purely from injected script.");
+        log("JustForkn Unity mod menu ready. Watching for the live Unity WebGL module.");
     }
 
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", mount);
